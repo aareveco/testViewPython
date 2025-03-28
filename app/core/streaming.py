@@ -10,9 +10,12 @@ import threading
 import time
 import pickle
 import struct
-from typing import Tuple, Callable
+import json
+from typing import Tuple, Callable, Dict, Any, Optional
 
 from app.core.screen_capture import ScreenCapture
+from app.core.remote_control import RemoteControl
+from app.core.remote_command import RemoteCommand, CommandType
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +36,17 @@ class StreamServer:
         self.connections = []
         self.running = False
         self.screen_capture = ScreenCapture()
+        self.remote_control = RemoteControl()
         self.quality = 50  # JPEG compression quality (0-100)
         self.fps_limit = 30  # Maximum frames per second
         self.frame_time = 1.0 / self.fps_limit
         self.last_frame_time = 0
 
-        logger.info(f"Stream server initialized with host={host}, port={port}")
+        # Command socket for remote control
+        self.command_socket = None
+        self.command_port = port + 1  # Use the next port for commands
+
+        logger.info(f"Stream server initialized with host={host}, port={port}, command_port={self.command_port}")
 
     def start(self) -> bool:
         """
@@ -52,18 +60,31 @@ class StreamServer:
             return False
 
         try:
+            # Start the video streaming socket
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
+
+            # Start the command socket for remote control
+            self.command_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.command_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.command_socket.bind((self.host, self.command_port))
+            self.command_socket.listen(5)
+
             self.running = True
 
-            # Start the connection acceptance thread
+            # Start the connection acceptance thread for video streaming
             self.accept_thread = threading.Thread(target=self._accept_connections)
             self.accept_thread.daemon = True
             self.accept_thread.start()
 
-            logger.info(f"Stream server started on {self.host or 'all interfaces'}:{self.port}")
+            # Start the command acceptance thread for remote control
+            self.command_thread = threading.Thread(target=self._accept_commands)
+            self.command_thread.daemon = True
+            self.command_thread.start()
+
+            logger.info(f"Stream server started on {self.host or 'all interfaces'}:{self.port} (video) and {self.command_port} (commands)")
             return True
         except Exception as e:
             logger.error(f"Failed to start stream server: {e}")
@@ -89,6 +110,14 @@ class StreamServer:
                 pass
             self.server_socket = None
 
+        # Close the command socket
+        if self.command_socket:
+            try:
+                self.command_socket.close()
+            except:
+                pass
+            self.command_socket = None
+
         logger.info("Stream server stopped")
 
     def set_quality(self, quality: int) -> None:
@@ -113,13 +142,13 @@ class StreamServer:
         logger.info(f"FPS limit set to {self.fps_limit}")
 
     def _accept_connections(self) -> None:
-        """Thread function to accept client connections"""
-        logger.info("Starting connection acceptance thread")
+        """Thread function to accept client connections for video streaming"""
+        logger.info("Starting video connection acceptance thread")
 
         while self.running:
             try:
                 client_socket, addr = self.server_socket.accept()
-                logger.info(f"New connection from {addr}")
+                logger.info(f"New video connection from {addr}")
 
                 # Start a new thread to handle this client
                 client_thread = threading.Thread(
@@ -132,8 +161,116 @@ class StreamServer:
                 self.connections.append(client_socket)
             except Exception as e:
                 if self.running:
-                    logger.error(f"Error accepting connection: {e}")
+                    logger.error(f"Error accepting video connection: {e}")
                 time.sleep(0.1)
+
+    def _accept_commands(self) -> None:
+        """Thread function to accept client connections for remote control commands"""
+        logger.info("Starting command acceptance thread")
+
+        while self.running:
+            try:
+                client_socket, addr = self.command_socket.accept()
+                logger.info(f"New command connection from {addr}")
+
+                # Start a new thread to handle this client's commands
+                command_thread = threading.Thread(
+                    target=self._handle_commands,
+                    args=(client_socket, addr)
+                )
+                command_thread.daemon = True
+                command_thread.start()
+            except Exception as e:
+                if self.running:
+                    logger.error(f"Error accepting command connection: {e}")
+                time.sleep(0.1)
+
+    def _handle_commands(self, client_socket: socket.socket, address: Tuple[str, int]) -> None:
+        """Thread function to handle remote control commands from a client"""
+        logger.info(f"Starting command handler for {address}")
+
+        try:
+            buffer = ""
+            while self.running:
+                # Receive data
+                data = client_socket.recv(4096).decode('utf-8')
+                if not data:
+                    break
+
+                # Add to buffer and process complete commands
+                buffer += data
+
+                # Process commands (assuming each command ends with a newline)
+                while '\n' in buffer:
+                    # Extract a command
+                    command_str, buffer = buffer.split('\n', 1)
+
+                    # Parse the command
+                    try:
+                        command = RemoteCommand.from_json(command_str)
+                        if command:
+                            self._execute_command(command)
+                    except Exception as e:
+                        logger.error(f"Error processing command: {e}")
+        except Exception as e:
+            logger.error(f"Error handling commands from {address}: {e}")
+        finally:
+            try:
+                client_socket.close()
+            except:
+                pass
+            logger.info(f"Command connection from {address} closed")
+
+    def _execute_command(self, command: RemoteCommand) -> None:
+        """Execute a remote control command"""
+        try:
+            if command.command_type == CommandType.MOUSE_MOVE:
+                self.remote_control.move_mouse(
+                    command.params['x'],
+                    command.params['y'],
+                    command.params.get('relative', False)
+                )
+            elif command.command_type == CommandType.MOUSE_CLICK:
+                self.remote_control.click_mouse(
+                    command.params.get('button', 'left'),
+                    command.params.get('double', False)
+                )
+            elif command.command_type == CommandType.MOUSE_DOWN:
+                self.remote_control.mouse_down(
+                    command.params.get('button', 'left')
+                )
+            elif command.command_type == CommandType.MOUSE_UP:
+                self.remote_control.mouse_up(
+                    command.params.get('button', 'left')
+                )
+            elif command.command_type == CommandType.MOUSE_SCROLL:
+                self.remote_control.scroll_mouse(
+                    command.params['clicks']
+                )
+            elif command.command_type == CommandType.KEY_PRESS:
+                self.remote_control.press_key(
+                    command.params['key']
+                )
+            elif command.command_type == CommandType.KEY_DOWN:
+                self.remote_control.key_down(
+                    command.params['key']
+                )
+            elif command.command_type == CommandType.KEY_UP:
+                self.remote_control.key_up(
+                    command.params['key']
+                )
+            elif command.command_type == CommandType.TYPE_TEXT:
+                self.remote_control.type_text(
+                    command.params['text']
+                )
+            elif command.command_type == CommandType.HOTKEY:
+                self.remote_control.hotkey(
+                    *command.params['keys']
+                )
+            else:
+                logger.warning(f"Unknown command type: {command.command_type}")
+        except Exception as e:
+            logger.error(f"Error executing command: {e}")
 
     def _handle_client(self, client_socket: socket.socket, address: Tuple[str, int]) -> None:
         """
@@ -204,9 +341,12 @@ class StreamClient:
         """
         self.callback = callback
         self.client_socket = None
+        self.command_socket = None
         self.running = False
         self.data = b""
         self.payload_size = struct.calcsize("L")
+        self.host = None
+        self.port = None
 
         logger.info("Stream client initialized")
 
@@ -226,8 +366,18 @@ class StreamClient:
             return False
 
         try:
+            # Store host and port for later use
+            self.host = host
+            self.port = port
+
+            # Connect to the video streaming socket
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((host, port))
+
+            # Connect to the command socket (port + 1)
+            self.command_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.command_socket.connect((host, port + 1))
+
             self.running = True
 
             # Start the frame receiving thread
@@ -235,22 +385,68 @@ class StreamClient:
             self.receive_thread.daemon = True
             self.receive_thread.start()
 
-            logger.info(f"Connected to stream server at {host}:{port}")
+            logger.info(f"Connected to stream server at {host}:{port} (video) and {port+1} (commands)")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to stream server: {e}")
+            # Clean up any sockets that were created
+            if self.client_socket:
+                try:
+                    self.client_socket.close()
+                except:
+                    pass
+                self.client_socket = None
+            if self.command_socket:
+                try:
+                    self.command_socket.close()
+                except:
+                    pass
+                self.command_socket = None
+            return False
+
+    def send_command(self, command: RemoteCommand) -> bool:
+        """
+        Send a remote control command to the server
+
+        Args:
+            command (RemoteCommand): The command to send
+
+        Returns:
+            bool: True if the command was sent successfully, False otherwise
+        """
+        if not self.running or not self.command_socket:
+            logger.error("Cannot send command: not connected")
+            return False
+
+        try:
+            # Convert the command to JSON and add a newline
+            command_str = command.to_json() + '\n'
+            # Send the command
+            self.command_socket.sendall(command_str.encode('utf-8'))
+            return True
+        except Exception as e:
+            logger.error(f"Error sending command: {e}")
             return False
 
     def disconnect(self) -> None:
         """Disconnect from the streaming server"""
         self.running = False
 
+        # Close the video socket
         if self.client_socket:
             try:
                 self.client_socket.close()
             except:
                 pass
             self.client_socket = None
+
+        # Close the command socket
+        if self.command_socket:
+            try:
+                self.command_socket.close()
+            except:
+                pass
+            self.command_socket = None
 
         logger.info("Disconnected from stream server")
 

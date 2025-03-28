@@ -12,10 +12,11 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QComboBox,
     QTabWidget, QGroupBox, QStatusBar, QMessageBox
 )
-from PyQt6.QtCore import QSize, Qt, QTimer
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtCore import QSize, Qt, QTimer, QEvent, QPoint
+from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QKeyEvent
 
 from app.core.streaming import StreamServer, StreamClient
+from app.core.remote_command import RemoteCommand
 from app.utils.network import get_local_ip
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,9 @@ class MainWindow(QMainWindow):
         self.is_hosting = False
         self.is_connected = False
         self.current_frame = None
+
+        # Remote control state
+        self.remote_control_enabled = False
 
         # Get local IP for hosting (do this before setting up tabs)
         self.local_ip = get_local_ip()
@@ -126,6 +130,16 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.disconnect_button)
         connection_layout.addLayout(button_layout)
 
+        # Remote control toggle
+        control_layout = QHBoxLayout()
+        self.remote_control_checkbox = QComboBox()
+        self.remote_control_checkbox.addItems(["View Only", "Remote Control"])
+        self.remote_control_checkbox.setCurrentIndex(0)  # View Only by default
+        self.remote_control_checkbox.currentIndexChanged.connect(self.on_remote_control_changed)
+        control_layout.addWidget(QLabel("Mode:"))
+        control_layout.addWidget(self.remote_control_checkbox)
+        connection_layout.addLayout(control_layout)
+
         layout.addWidget(connection_group)
 
         # Recent connections group
@@ -144,6 +158,16 @@ class MainWindow(QMainWindow):
         self.remote_screen_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.remote_screen_label.setMinimumSize(640, 480)
         self.remote_screen_label.setStyleSheet("background-color: #222; color: #aaa;")
+        self.remote_screen_label.setMouseTracking(True)  # Track mouse movements
+        self.remote_screen_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Allow keyboard focus
+
+        # Install event filter to capture mouse and keyboard events
+        self.remote_screen_label.installEventFilter(self)
+
+        # Variables to track mouse state
+        self.last_mouse_pos = None
+        self.mouse_buttons_pressed = set()
+
         display_layout.addWidget(self.remote_screen_label)
 
         layout.addWidget(display_group)
@@ -378,8 +402,174 @@ class MainWindow(QMainWindow):
                                   Qt.AspectRatioMode.KeepAspectRatio)
             self.remote_screen_label.setPixmap(pixmap)
 
-            # Store the current frame
+            # Store the current frame and its dimensions
             self.current_frame = frame
+            self.remote_frame_width = width
+            self.remote_frame_height = height
+
+    def on_remote_control_changed(self, index):
+        """Handle remote control mode change"""
+        self.remote_control_enabled = (index == 1)  # 1 = Remote Control, 0 = View Only
+
+        if self.remote_control_enabled:
+            self.status_bar.showMessage("Remote control enabled")
+            # Set focus to the remote screen label to receive keyboard events
+            self.remote_screen_label.setFocus()
+        else:
+            self.status_bar.showMessage("View only mode")
+
+        logger.info(f"Remote control {'enabled' if self.remote_control_enabled else 'disabled'}")
+
+    def eventFilter(self, obj, event):
+        """Filter events for remote control"""
+        if obj is self.remote_screen_label and self.is_connected and self.stream_client and self.remote_control_enabled:
+            # Handle mouse events
+            if event.type() == QEvent.Type.MouseMove:
+                return self._handle_mouse_move(event)
+            elif event.type() == QEvent.Type.MouseButtonPress:
+                return self._handle_mouse_press(event)
+            elif event.type() == QEvent.Type.MouseButtonRelease:
+                return self._handle_mouse_release(event)
+            elif event.type() == QEvent.Type.Wheel:
+                return self._handle_mouse_wheel(event)
+            # Handle keyboard events
+            elif event.type() == QEvent.Type.KeyPress:
+                return self._handle_key_press(event)
+            elif event.type() == QEvent.Type.KeyRelease:
+                return self._handle_key_release(event)
+
+        # Let the event propagate
+        return super().eventFilter(obj, event)
+
+    def _handle_mouse_move(self, event):
+        """Handle mouse move events"""
+        if not hasattr(self, 'remote_frame_width') or not hasattr(self, 'remote_frame_height'):
+            return False
+
+        # Get the position relative to the label
+        pos = event.position()
+        label_width = self.remote_screen_label.width()
+        label_height = self.remote_screen_label.height()
+
+        # Calculate the scaling factor
+        scale_x = self.remote_frame_width / label_width
+        scale_y = self.remote_frame_height / label_height
+
+        # Calculate the position on the remote screen
+        remote_x = int(pos.x() * scale_x)
+        remote_y = int(pos.y() * scale_y)
+
+        # Create and send the mouse move command
+        if self.last_mouse_pos:
+            # Calculate relative movement if needed
+            # For now, we'll use absolute positioning
+            pass
+
+        self.last_mouse_pos = (remote_x, remote_y)
+
+        # Send the command to the server
+        command = RemoteCommand.create_mouse_move(remote_x, remote_y)
+        self.stream_client.send_command(command)
+
+        return True
+
+    def _handle_mouse_press(self, event):
+        """Handle mouse press events"""
+        button = self._qt_button_to_pyautogui(event.button())
+        if button:
+            # Add to pressed buttons set
+            self.mouse_buttons_pressed.add(button)
+
+            # Send mouse down command
+            command = RemoteCommand.create_mouse_down(button)
+            self.stream_client.send_command(command)
+
+        return True
+
+    def _handle_mouse_release(self, event):
+        """Handle mouse release events"""
+        button = self._qt_button_to_pyautogui(event.button())
+        if button and button in self.mouse_buttons_pressed:
+            # Remove from pressed buttons set
+            self.mouse_buttons_pressed.remove(button)
+
+            # Send mouse up command
+            command = RemoteCommand.create_mouse_up(button)
+            self.stream_client.send_command(command)
+
+        return True
+
+    def _handle_mouse_wheel(self, event):
+        """Handle mouse wheel events"""
+        # PyQt6 wheel events use angleDelta
+        delta = event.angleDelta().y()
+
+        # Convert to scroll clicks (positive for up, negative for down)
+        clicks = delta // 120  # 120 is the standard delta for one click
+
+        if clicks != 0:
+            # Send scroll command
+            command = RemoteCommand.create_mouse_scroll(clicks)
+            self.stream_client.send_command(command)
+
+        return True
+
+    def _handle_key_press(self, event):
+        """Handle key press events"""
+        key = self._qt_key_to_pyautogui(event.key())
+        if key:
+            # Send key down command
+            command = RemoteCommand.create_key_down(key)
+            self.stream_client.send_command(command)
+
+        return True
+
+    def _handle_key_release(self, event):
+        """Handle key release events"""
+        key = self._qt_key_to_pyautogui(event.key())
+        if key:
+            # Send key up command
+            command = RemoteCommand.create_key_up(key)
+            self.stream_client.send_command(command)
+
+        return True
+
+    def _qt_button_to_pyautogui(self, qt_button):
+        """Convert Qt mouse button to PyAutoGUI button name"""
+        if qt_button == Qt.MouseButton.LeftButton:
+            return 'left'
+        elif qt_button == Qt.MouseButton.RightButton:
+            return 'right'
+        elif qt_button == Qt.MouseButton.MiddleButton:
+            return 'middle'
+        return None
+
+    def _qt_key_to_pyautogui(self, qt_key):
+        """Convert Qt key code to PyAutoGUI key name"""
+        # This is a simplified mapping, you may need to expand it
+        key_map = {
+            Qt.Key.Key_A: 'a', Qt.Key.Key_B: 'b', Qt.Key.Key_C: 'c',
+            Qt.Key.Key_D: 'd', Qt.Key.Key_E: 'e', Qt.Key.Key_F: 'f',
+            Qt.Key.Key_G: 'g', Qt.Key.Key_H: 'h', Qt.Key.Key_I: 'i',
+            Qt.Key.Key_J: 'j', Qt.Key.Key_K: 'k', Qt.Key.Key_L: 'l',
+            Qt.Key.Key_M: 'm', Qt.Key.Key_N: 'n', Qt.Key.Key_O: 'o',
+            Qt.Key.Key_P: 'p', Qt.Key.Key_Q: 'q', Qt.Key.Key_R: 'r',
+            Qt.Key.Key_S: 's', Qt.Key.Key_T: 't', Qt.Key.Key_U: 'u',
+            Qt.Key.Key_V: 'v', Qt.Key.Key_W: 'w', Qt.Key.Key_X: 'x',
+            Qt.Key.Key_Y: 'y', Qt.Key.Key_Z: 'z',
+            Qt.Key.Key_0: '0', Qt.Key.Key_1: '1', Qt.Key.Key_2: '2',
+            Qt.Key.Key_3: '3', Qt.Key.Key_4: '4', Qt.Key.Key_5: '5',
+            Qt.Key.Key_6: '6', Qt.Key.Key_7: '7', Qt.Key.Key_8: '8',
+            Qt.Key.Key_9: '9',
+            Qt.Key.Key_Space: 'space', Qt.Key.Key_Return: 'enter',
+            Qt.Key.Key_Tab: 'tab', Qt.Key.Key_Escape: 'esc',
+            Qt.Key.Key_Backspace: 'backspace', Qt.Key.Key_Delete: 'delete',
+            Qt.Key.Key_Shift: 'shift', Qt.Key.Key_Control: 'ctrl',
+            Qt.Key.Key_Alt: 'alt', Qt.Key.Key_Up: 'up',
+            Qt.Key.Key_Down: 'down', Qt.Key.Key_Left: 'left',
+            Qt.Key.Key_Right: 'right'
+        }
+        return key_map.get(qt_key)
 
     def on_start_hosting_clicked(self):
         """Handle start hosting button click"""
