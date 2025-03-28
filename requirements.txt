@@ -1,0 +1,29 @@
+# GUI Framework
+PyQt6>=6.4.0  # Cross-platform GUI framework
+
+# Screen Capture and Remote Control
+pyautogui>=0.9.53  # For mouse and keyboard control
+pillow>=9.3.0  # For image processing
+mss>=7.0.1  # Fast screen capture, multi-monitor support
+keyboard>=0.13.5  # Keyboard hooks and control
+mouse>=0.7.1  # Mouse hooks and control
+
+# Networking and Streaming
+opencv-python>=4.6.0  # Computer vision and image processing
+numpy>=1.23.5  # Required for OpenCV and numerical operations
+websockets>=10.4  # WebSocket implementation for real-time communication
+protobuf>=4.21.9  # Protocol buffers for efficient data serialization
+grpcio>=1.50.0  # gRPC for high-performance RPC
+pyzmq>=24.0.1  # ZeroMQ for messaging
+
+# Hardware Integration
+pyserial>=3.5  # Serial port communication
+pyusb>=1.2.1  # USB device communication
+
+# Utilities
+pycryptodome>=3.16.0  # Cryptography for secure connections
+psutil>=5.9.4  # System monitoring and process utilities
+loguru>=0.6.0  # Better logging
+
+# Packaging
+pyinstaller>=5.6.2  # For creating standalone executables
