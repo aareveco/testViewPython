@@ -7,18 +7,23 @@ import platform
 import psutil
 import cv2
 import numpy as np
+import json
+import os
+import threading
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QComboBox,
     QTabWidget, QGroupBox, QStatusBar, QMessageBox,
-    QCheckBox
+    QCheckBox, QProgressBar, QFileDialog
 )
-from PyQt6.QtCore import QSize, Qt, QTimer, QEvent, QPoint
-from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QKeyEvent
+from PyQt6.QtCore import QSize, Qt, QTimer, QEvent, QPoint, QUrl
+from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QKeyEvent, QIcon
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from app.core.streaming import StreamServer, StreamClient
 from app.core.remote_command import RemoteCommand
 from app.utils.network import get_local_ip
+from app.utils.network_diagnostics import ConnectionTester, run_network_diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,11 @@ class MainWindow(QMainWindow):
         # Remote control state
         self.remote_control_enabled = False
 
+        # Maximized view state
+        self.maximized_view = None
+        self.original_tab_index = 0
+        self.original_widgets = {}
+
         # Get local IP for hosting (do this before setting up tabs)
         self.local_ip = get_local_ip()
 
@@ -57,6 +67,7 @@ class MainWindow(QMainWindow):
         self.setup_connect_tab()
         self.setup_host_tab()
         self.setup_settings_tab()
+        self.setup_browser_tab()
 
         # Set up status bar
         self.status_bar = QStatusBar()
@@ -150,9 +161,40 @@ class MainWindow(QMainWindow):
         recent_layout.addWidget(self.recent_list)
         layout.addWidget(recent_group)
 
+        # Network diagnostics group
+        diagnostics_group = QGroupBox("Network Diagnostics")
+        diagnostics_layout = QVBoxLayout(diagnostics_group)
+
+        # Run diagnostics button
+        diagnostics_button_layout = QHBoxLayout()
+        self.run_diagnostics_button = QPushButton("Run Network Diagnostics")
+        self.run_diagnostics_button.clicked.connect(self.on_run_diagnostics_clicked)
+        self.run_diagnostics_button.setToolTip("Check network connectivity to the host")
+        diagnostics_button_layout.addWidget(self.run_diagnostics_button)
+        diagnostics_layout.addLayout(diagnostics_button_layout)
+
+        # Diagnostics results
+        self.diagnostics_results = QLabel("Click 'Run Network Diagnostics' to check connectivity")
+        self.diagnostics_results.setWordWrap(True)
+        self.diagnostics_results.setStyleSheet("background-color: #f0f0f0; padding: 5px; border-radius: 3px;")
+        diagnostics_layout.addWidget(self.diagnostics_results)
+
+        layout.addWidget(diagnostics_group)
+
         # Remote screen display
         display_group = QGroupBox("Remote Screen")
         display_layout = QVBoxLayout(display_group)
+
+        # Add maximize button for remote screen
+        display_controls = QHBoxLayout()
+        display_controls.addStretch(1)  # Push button to the right
+
+        self.maximize_remote_button = QPushButton("Maximize")
+        self.maximize_remote_button.clicked.connect(lambda: self.toggle_maximize_view("remote"))
+        self.maximize_remote_button.setToolTip("Maximize/restore the remote screen view")
+        display_controls.addWidget(self.maximize_remote_button)
+
+        display_layout.addLayout(display_controls)
 
         # Create a label to display the remote screen
         self.remote_screen_label = QLabel("Not connected")
@@ -367,6 +409,492 @@ class MainWindow(QMainWindow):
         if self.stream_server:
             self.stream_server.set_fps_limit(fps)
 
+    def setup_browser_tab(self):
+        """Set up the Web Browser tab"""
+        browser_tab = QWidget()
+        layout = QVBoxLayout(browser_tab)
+
+        # Navigation controls
+        nav_layout = QHBoxLayout()
+
+        # Back button
+        self.back_button = QPushButton("Back")
+        self.back_button.clicked.connect(self.on_back_clicked)
+        self.back_button.setToolTip("Go back to the previous page")
+        nav_layout.addWidget(self.back_button)
+
+        # Forward button
+        self.forward_button = QPushButton("Forward")
+        self.forward_button.clicked.connect(self.on_forward_clicked)
+        self.forward_button.setToolTip("Go forward to the next page")
+        nav_layout.addWidget(self.forward_button)
+
+        # Refresh button
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.on_refresh_clicked)
+        self.refresh_button.setToolTip("Reload the current page")
+        nav_layout.addWidget(self.refresh_button)
+
+        # Home button
+        self.home_button = QPushButton("Home")
+        self.home_button.clicked.connect(self.on_home_clicked)
+        self.home_button.setToolTip("Go to the home page (Google)")
+        nav_layout.addWidget(self.home_button)
+
+        # URL bar
+        self.url_bar = QLineEdit()
+        self.url_bar.setPlaceholderText("Enter URL (e.g., https://www.google.com)")
+        self.url_bar.returnPressed.connect(self.on_url_entered)
+        nav_layout.addWidget(self.url_bar)
+
+        # Go button
+        self.go_button = QPushButton("Go")
+        self.go_button.clicked.connect(self.on_url_entered)
+        self.go_button.setToolTip("Navigate to the URL")
+        nav_layout.addWidget(self.go_button)
+
+        # Add bookmark button
+        self.add_bookmark_button = QPushButton("Add Bookmark")
+        self.add_bookmark_button.clicked.connect(self.on_add_bookmark_clicked)
+        self.add_bookmark_button.setToolTip("Add current page to bookmarks")
+        nav_layout.addWidget(self.add_bookmark_button)
+
+        layout.addLayout(nav_layout)
+
+        # Bookmarks bar
+        bookmarks_container = QVBoxLayout()
+
+        # Bookmarks controls
+        bookmarks_controls = QHBoxLayout()
+        bookmarks_controls.addWidget(QLabel("Bookmarks:"))
+
+        # Save bookmarks button
+        self.save_bookmarks_button = QPushButton("Save Bookmarks")
+        self.save_bookmarks_button.clicked.connect(self.on_save_bookmarks_clicked)
+        self.save_bookmarks_button.setToolTip("Save bookmarks to a file")
+        bookmarks_controls.addWidget(self.save_bookmarks_button)
+
+        # Load bookmarks button
+        self.load_bookmarks_button = QPushButton("Load Bookmarks")
+        self.load_bookmarks_button.clicked.connect(self.on_load_bookmarks_clicked)
+        self.load_bookmarks_button.setToolTip("Load bookmarks from a file")
+        bookmarks_controls.addWidget(self.load_bookmarks_button)
+
+        bookmarks_container.addLayout(bookmarks_controls)
+
+        # Bookmarks list layout
+        bookmarks_layout = QHBoxLayout()
+
+        # Bookmarks list (initially empty)
+        self.bookmarks = {}
+
+        bookmarks_container.addLayout(bookmarks_layout)
+        layout.addLayout(bookmarks_container)
+        self.bookmarks_layout = bookmarks_layout
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setVisible(False)  # Initially hidden
+        layout.addWidget(self.progress_bar)
+
+        # Add maximize button for web view
+        web_controls = QHBoxLayout()
+        web_controls.addStretch(1)  # Push button to the right
+
+        self.maximize_web_button = QPushButton("Maximize")
+        self.maximize_web_button.clicked.connect(lambda: self.toggle_maximize_view("web"))
+        self.maximize_web_button.setToolTip("Maximize/restore the web browser view")
+        web_controls.addWidget(self.maximize_web_button)
+
+        layout.addLayout(web_controls)
+
+        # Web view
+        self.web_view = QWebEngineView()
+        self.web_view.loadStarted.connect(self.on_load_started)
+        self.web_view.loadProgress.connect(self.on_load_progress)
+        self.web_view.loadFinished.connect(self.on_load_finished)
+        self.web_view.urlChanged.connect(self.on_url_changed)
+
+        # Set default page
+        self.web_view.setUrl(QUrl("https://www.google.com"))
+
+        layout.addWidget(self.web_view)
+
+        self.tab_widget.addTab(browser_tab, "Web Browser")
+
+    def on_back_clicked(self):
+        """Handle back button click"""
+        if self.web_view.history().canGoBack():
+            self.web_view.back()
+
+    def on_forward_clicked(self):
+        """Handle forward button click"""
+        if self.web_view.history().canGoForward():
+            self.web_view.forward()
+
+    def on_refresh_clicked(self):
+        """Handle refresh button click"""
+        self.web_view.reload()
+
+    def on_home_clicked(self):
+        """Handle home button click"""
+        self.web_view.setUrl(QUrl("https://www.google.com"))
+
+    def on_add_bookmark_clicked(self):
+        """Handle add bookmark button click"""
+        url = self.web_view.url().toString()
+        title = self.web_view.title()
+
+        # Don't add if already bookmarked
+        if url in self.bookmarks:
+            self.status_bar.showMessage(f"Already bookmarked: {title}", 3000)
+            return
+
+        # Create a button for this bookmark
+        bookmark_button = QPushButton(title)
+        bookmark_button.setToolTip(url)
+        bookmark_button.clicked.connect(lambda: self.web_view.setUrl(QUrl(url)))
+
+        # Add to bookmarks layout
+        self.bookmarks_layout.addWidget(bookmark_button)
+
+        # Store in bookmarks dictionary
+        self.bookmarks[url] = {
+            'title': title,
+            'button': bookmark_button
+        }
+
+        self.status_bar.showMessage(f"Bookmark added: {title}", 3000)
+
+    def on_save_bookmarks_clicked(self):
+        """Handle save bookmarks button click"""
+        if not self.bookmarks:
+            self.status_bar.showMessage("No bookmarks to save", 3000)
+            return
+
+        # Open file dialog to select save location
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Bookmarks",
+            os.path.expanduser("~/bookmarks.json"),
+            "JSON Files (*.json)"
+        )
+
+        if not file_path:
+            return  # User cancelled
+
+        try:
+            # Convert bookmarks to serializable format
+            bookmarks_data = {}
+            for url, data in self.bookmarks.items():
+                bookmarks_data[url] = {
+                    'title': data['title']
+                }
+
+            # Save to file
+            with open(file_path, 'w') as f:
+                json.dump(bookmarks_data, f, indent=2)
+
+            self.status_bar.showMessage(f"Bookmarks saved to {file_path}", 3000)
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Failed to save bookmarks: {e}")
+
+    def on_load_bookmarks_clicked(self):
+        """Handle load bookmarks button click"""
+        # Open file dialog to select file to load
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Bookmarks",
+            os.path.expanduser("~/bookmarks.json"),
+            "JSON Files (*.json)"
+        )
+
+        if not file_path:
+            return  # User cancelled
+
+        try:
+            # Load from file
+            with open(file_path, 'r') as f:
+                bookmarks_data = json.load(f)
+
+            # Clear existing bookmarks
+            self._clear_bookmarks()
+
+            # Add loaded bookmarks
+            for url, data in bookmarks_data.items():
+                title = data['title']
+
+                # Create a button for this bookmark
+                bookmark_button = QPushButton(title)
+                bookmark_button.setToolTip(url)
+                bookmark_button.clicked.connect(lambda u=url: self.web_view.setUrl(QUrl(u)))
+
+                # Add to bookmarks layout
+                self.bookmarks_layout.addWidget(bookmark_button)
+
+                # Store in bookmarks dictionary
+                self.bookmarks[url] = {
+                    'title': title,
+                    'button': bookmark_button
+                }
+
+            self.status_bar.showMessage(f"Loaded {len(bookmarks_data)} bookmarks from {file_path}", 3000)
+        except Exception as e:
+            QMessageBox.warning(self, "Load Error", f"Failed to load bookmarks: {e}")
+
+    def _clear_bookmarks(self):
+        """Clear all bookmarks"""
+        # Remove all bookmark buttons from layout
+        for url, data in self.bookmarks.items():
+            self.bookmarks_layout.removeWidget(data['button'])
+            data['button'].deleteLater()
+
+        # Clear bookmarks dictionary
+        self.bookmarks = {}
+
+    def on_run_diagnostics_clicked(self):
+        """Handle run diagnostics button click"""
+        host = self.host_input.text()
+        port_str = self.port_input.text()
+
+        if not host:
+            self.diagnostics_results.setText("Please enter a host address first")
+            self.diagnostics_results.setStyleSheet("background-color: #ffeeee; padding: 5px; border-radius: 3px;")
+            return
+
+        try:
+            port = int(port_str)
+            if port < 1 or port > 65535:
+                raise ValueError("Port out of range")
+        except ValueError:
+            self.diagnostics_results.setText("Please enter a valid port number (1-65535)")
+            self.diagnostics_results.setStyleSheet("background-color: #ffeeee; padding: 5px; border-radius: 3px;")
+            return
+
+        # Update UI
+        self.diagnostics_results.setText("Running diagnostics...")
+        self.diagnostics_results.setStyleSheet("background-color: #ffffee; padding: 5px; border-radius: 3px;")
+        self.run_diagnostics_button.setEnabled(False)
+
+        # Run diagnostics in a separate thread to avoid freezing the UI
+        threading.Thread(target=self._run_diagnostics_thread, args=(host, port), daemon=True).start()
+
+    def _run_diagnostics_thread(self, host, port):
+        """Run network diagnostics in a separate thread"""
+        try:
+            # Run the diagnostics
+            results = run_network_diagnostics(host, [port, port+1])
+
+            # Format the results
+            message = f"Diagnostics for {host}:\n\n"
+
+            # Ping results
+            if results["ping"]["success"]:
+                message += f"✅ Ping successful ({results['ping']['time_ms']:.1f} ms)\n"
+            else:
+                message += f"❌ Ping failed - Host may be unreachable\n"
+
+            # Port results
+            for p, is_open in results["ports"].items():
+                if is_open:
+                    message += f"✅ Port {p} is open\n"
+                else:
+                    message += f"❌ Port {p} is closed\n"
+
+            # Add recommendations
+            if results["recommendations"]:
+                message += "\nRecommendations:\n"
+                for i, rec in enumerate(results["recommendations"], 1):
+                    message += f"{i}. {rec}\n"
+
+            # Add local IP information
+            message += f"\nYour local IP: {results['local_ip']}\n"
+            message += f"Target host: {host}\n"
+
+            # Update UI in the main thread
+            self._update_diagnostics_ui(message, results["firewall_issues"])
+        except Exception as e:
+            # Update UI with error message
+            self._update_diagnostics_ui(f"Error running diagnostics: {e}", True)
+
+    def _update_diagnostics_ui(self, message, has_issues):
+        """Update the diagnostics UI (called from the main thread)"""
+        # Use invokeMethod to update UI from a different thread
+        QTimer.singleShot(0, lambda: self._do_update_diagnostics_ui(message, has_issues))
+
+    def _do_update_diagnostics_ui(self, message, has_issues):
+        """Actually update the UI (must be called from the main thread)"""
+        self.diagnostics_results.setText(message)
+
+        if has_issues:
+            self.diagnostics_results.setStyleSheet("background-color: #ffeeee; padding: 5px; border-radius: 3px;")
+        else:
+            self.diagnostics_results.setStyleSheet("background-color: #eeffee; padding: 5px; border-radius: 3px;")
+
+        self.run_diagnostics_button.setEnabled(True)
+
+    def toggle_maximize_view(self, view_type):
+        """Toggle between normal and maximized view
+
+        Args:
+            view_type (str): Type of view to maximize ('remote' or 'web')
+        """
+        if self.maximized_view == view_type:
+            # We're already maximized, so restore
+            self._restore_view()
+        else:
+            # Maximize the view
+            self._maximize_view(view_type)
+
+    def _maximize_view(self, view_type):
+        """Maximize a specific view
+
+        Args:
+            view_type (str): Type of view to maximize ('remote' or 'web')
+        """
+        # Save current state
+        self.maximized_view = view_type
+        self.original_tab_index = self.tab_widget.currentIndex()
+
+        # Hide the tab widget
+        self.tab_widget.setVisible(False)
+
+        # Create a container for the maximized view
+        max_container = QWidget()
+        max_layout = QVBoxLayout(max_container)
+
+        # Create controls for the maximized view
+        controls_layout = QHBoxLayout()
+        controls_layout.addStretch(1)  # Push button to the right
+
+        restore_button = QPushButton("Restore View")
+        restore_button.clicked.connect(self._restore_view)
+        restore_button.setToolTip("Return to normal view")
+        controls_layout.addWidget(restore_button)
+
+        max_layout.addLayout(controls_layout)
+
+        # Move the appropriate widget to the maximized container
+        if view_type == "remote":
+            # Save original parent
+            self.original_widgets["remote"] = {
+                "widget": self.remote_screen_label,
+                "parent": self.remote_screen_label.parent(),
+                "layout": self.remote_screen_label.parent().layout()
+            }
+
+            # Reparent the widget
+            self.original_widgets["remote"]["layout"].removeWidget(self.remote_screen_label)
+            max_layout.addWidget(self.remote_screen_label)
+
+            # Update button text
+            self.maximize_remote_button.setText("Restore")
+
+        elif view_type == "web":
+            # Save original parent
+            self.original_widgets["web"] = {
+                "widget": self.web_view,
+                "parent": self.web_view.parent(),
+                "layout": self.web_view.parent().layout()
+            }
+
+            # Reparent the widget
+            self.original_widgets["web"]["layout"].removeWidget(self.web_view)
+            max_layout.addWidget(self.web_view)
+
+            # Update button text
+            self.maximize_web_button.setText("Restore")
+
+        # Add the maximized container to the main layout
+        self.main_layout.addWidget(max_container)
+
+        # Update status
+        self.status_bar.showMessage(f"View maximized. Click 'Restore View' to return to normal view.", 3000)
+
+    def _restore_view(self):
+        """Restore the view from maximized state"""
+        if not self.maximized_view:
+            return
+
+        # Get the current maximized container (last widget in main layout)
+        max_container = self.main_layout.itemAt(self.main_layout.count() - 1).widget()
+
+        # Restore the widget to its original parent
+        if self.maximized_view == "remote":
+            # Get the widget and its original parent info
+            widget_info = self.original_widgets["remote"]
+
+            # Remove from maximized container
+            max_container.layout().removeWidget(self.remote_screen_label)
+
+            # Add back to original parent
+            widget_info["layout"].addWidget(self.remote_screen_label)
+
+            # Update button text
+            self.maximize_remote_button.setText("Maximize")
+
+        elif self.maximized_view == "web":
+            # Get the widget and its original parent info
+            widget_info = self.original_widgets["web"]
+
+            # Remove from maximized container
+            max_container.layout().removeWidget(self.web_view)
+
+            # Add back to original parent
+            widget_info["layout"].addWidget(self.web_view)
+
+            # Update button text
+            self.maximize_web_button.setText("Maximize")
+
+        # Remove the maximized container
+        self.main_layout.removeWidget(max_container)
+        max_container.deleteLater()
+
+        # Show the tab widget again
+        self.tab_widget.setVisible(True)
+
+        # Restore the original tab
+        self.tab_widget.setCurrentIndex(self.original_tab_index)
+
+        # Clear maximized state
+        self.maximized_view = None
+        self.original_widgets = {}
+
+        # Update status
+        self.status_bar.showMessage("View restored", 3000)
+
+    def on_url_entered(self):
+        """Handle URL entry"""
+        url = self.url_bar.text()
+
+        # Add http:// if no protocol specified
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "http://" + url
+
+        self.web_view.setUrl(QUrl(url))
+
+    def on_url_changed(self, url):
+        """Handle URL change"""
+        self.url_bar.setText(url.toString())
+
+    def on_load_started(self):
+        """Handle page load started"""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+
+    def on_load_progress(self, progress):
+        """Handle page load progress"""
+        self.progress_bar.setValue(progress)
+
+    def on_load_finished(self, success):
+        """Handle page load finished"""
+        self.progress_bar.setVisible(False)
+
+        if not success:
+            self.status_bar.showMessage("Failed to load page", 3000)
+
     def on_connect_clicked(self):
         """Handle connect button click"""
         host = self.host_input.text()
@@ -416,7 +944,21 @@ class MainWindow(QMainWindow):
             self.stream_client = None
             self.connect_button.setEnabled(True)
             self.status_bar.showMessage(f"Failed to connect to {host}")
-            QMessageBox.warning(self, "Connection Error", f"Failed to connect to {host}")
+
+            # Show a more helpful error message with troubleshooting steps
+            error_msg = (
+                f"Failed to connect to {host}\n\n"
+                "Possible reasons:\n"
+                "1. The host is not running the AppStream server\n"
+                "2. A firewall is blocking the connection\n"
+                "3. The host and port combination is incorrect\n\n"
+                "Troubleshooting steps:\n"
+                "1. Verify the host is running AppStream in hosting mode\n"
+                "2. Check that both computers are on the same network\n"
+                "3. Try disabling firewalls temporarily\n"
+                "4. Use the 'Run Network Diagnostics' button for more information"
+            )
+            QMessageBox.warning(self, "Connection Error", error_msg)
 
     def on_disconnect_clicked(self):
         """Handle disconnect button click"""

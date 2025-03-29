@@ -328,30 +328,89 @@ class StreamServer:
                     time.sleep(0.001)  # Small sleep to prevent CPU hogging
                     continue
 
-                # Capture the screen
-                frame = self.screen_capture.capture_screen()
-                if frame is None:
-                    logger.warning("Failed to capture screen")
+                try:
+                    # Capture the screen with timeout protection
+                    capture_start = time.time()
+                    frame = self.screen_capture.capture_screen()
+                    capture_time = time.time() - capture_start
+
+                    # Log warning if capture takes too long
+                    if capture_time > 0.1:  # More than 100ms is suspicious
+                        logger.warning(f"Screen capture took {capture_time:.2f}s, which is unusually long")
+
+                    if frame is None:
+                        logger.warning("Failed to capture screen")
+                        time.sleep(0.1)
+                        continue
+
+                    # Verify frame integrity
+                    if not isinstance(frame, np.ndarray) or frame.size == 0 or len(frame.shape) < 3:
+                        logger.warning(f"Invalid frame format: {type(frame)}, shape: {getattr(frame, 'shape', 'unknown')}")
+                        time.sleep(0.1)
+                        continue
+
+                    # Convert to BGR format (if not already)
+                    if len(frame.shape) == 3 and frame.shape[2] == 4:  # RGBA
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+
+                    # Resize frame if it's too large (helps prevent memory issues)
+                    max_dimension = 1920  # Maximum width or height
+                    height, width = frame.shape[:2]
+                    if width > max_dimension or height > max_dimension:
+                        scale = max_dimension / max(width, height)
+                        new_width = int(width * scale)
+                        new_height = int(height * scale)
+                        frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                        logger.debug(f"Resized frame from {width}x{height} to {new_width}x{new_height}")
+
+                    # Compress the frame with error handling
+                    try:
+                        encode_result = cv2.imencode(
+                            '.jpg',
+                            frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, self.quality]
+                        )
+
+                        if not encode_result[0]:
+                            logger.warning("Failed to encode frame")
+                            time.sleep(0.1)
+                            continue
+
+                        encoded_frame = encode_result[1]
+                    except Exception as encode_error:
+                        logger.error(f"Error encoding frame: {encode_error}")
+                        time.sleep(0.1)
+                        continue
+
+                    # Serialize the frame with error handling
+                    try:
+                        data = pickle.dumps(encoded_frame)
+                    except Exception as pickle_error:
+                        logger.error(f"Error serializing frame: {pickle_error}")
+                        time.sleep(0.1)
+                        continue
+
+                    # Send the frame size followed by the frame data
+                    try:
+                        message_size = struct.pack("L", len(data))
+                        client_socket.sendall(message_size + data)
+                    except ConnectionResetError:
+                        logger.error(f"Connection reset by client {address}")
+                        # Connection broken, exit the loop
+                        break
+                    except BrokenPipeError:
+                        logger.error(f"Broken pipe when sending to client {address}")
+                        # Connection broken, exit the loop
+                        break
+                    except Exception as send_error:
+                        logger.error(f"Error sending frame to client {address}: {send_error}")
+                        # Connection likely broken, exit the loop
+                        break
+
+                except Exception as frame_error:
+                    logger.error(f"Error processing frame: {frame_error}")
                     time.sleep(0.1)
                     continue
-
-                # Convert to BGR format (if not already)
-                if frame.shape[2] == 4:  # RGBA
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-
-                # Compress the frame
-                _, encoded_frame = cv2.imencode(
-                    '.jpg',
-                    frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, self.quality]
-                )
-
-                # Serialize the frame
-                data = pickle.dumps(encoded_frame)
-
-                # Send the frame size followed by the frame data
-                message_size = struct.pack("L", len(data))
-                client_socket.sendall(message_size + data)
 
                 self.last_frame_time = current_time
         except Exception as e:
@@ -551,44 +610,129 @@ class StreamClient:
         """Thread function to receive frames from the server"""
         logger.info("Starting frame receiving thread")
 
+        # Set a timeout on the socket to prevent hanging
+        try:
+            self.client_socket.settimeout(5.0)  # 5 second timeout
+        except Exception as e:
+            logger.warning(f"Could not set socket timeout: {e}")
+
         while self.running:
             try:
-                # Receive data until we have the message size
-                while len(self.data) < self.payload_size:
-                    packet = self.client_socket.recv(4096)
-                    if not packet:
-                        raise ConnectionError("Connection closed by server")
-                    self.data += packet
+                # Get the message size with timeout protection
+                start_time = time.time()
+                while len(self.data) < self.payload_size and self.running:
+                    try:
+                        packet = self.client_socket.recv(4096)
+                        if not packet:
+                            # Connection closed
+                            logger.warning("Server closed connection (empty packet received)")
+                            self.running = False
+                            break
+                        self.data += packet
+
+                        # Check for timeout
+                        if time.time() - start_time > 10.0:  # 10 second overall timeout
+                            logger.warning("Timeout while receiving message size")
+                            self.running = False
+                            break
+                    except socket.timeout:
+                        logger.warning("Socket timeout while receiving message size")
+                        # Don't break, just try again
+                        continue
+                    except ConnectionResetError:
+                        logger.error("Connection reset by server")
+                        self.running = False
+                        break
+                    except Exception as recv_error:
+                        logger.error(f"Error receiving data: {recv_error}")
+                        self.running = False
+                        break
+
+                if not self.running:
+                    break
 
                 # Extract the message size
-                packed_msg_size = self.data[:self.payload_size]
-                self.data = self.data[self.payload_size:]
-                msg_size = struct.unpack("L", packed_msg_size)[0]
+                try:
+                    packed_msg_size = self.data[:self.payload_size]
+                    self.data = self.data[self.payload_size:]
+                    msg_size = struct.unpack("L", packed_msg_size)[0]
 
-                # Receive the rest of the data
-                while len(self.data) < msg_size:
-                    packet = self.client_socket.recv(4096)
-                    if not packet:
-                        raise ConnectionError("Connection closed by server")
-                    self.data += packet
+                    # Sanity check on message size
+                    if msg_size <= 0 or msg_size > 10 * 1024 * 1024:  # Max 10MB per frame
+                        logger.warning(f"Invalid message size: {msg_size} bytes")
+                        # Reset the data buffer and try again
+                        self.data = b""
+                        continue
+                except Exception as unpack_error:
+                    logger.error(f"Error unpacking message size: {unpack_error}")
+                    # Reset the data buffer and try again
+                    self.data = b""
+                    continue
+
+                # Get the frame data with timeout protection
+                start_time = time.time()
+                while len(self.data) < msg_size and self.running:
+                    try:
+                        packet = self.client_socket.recv(4096)
+                        if not packet:
+                            # Connection closed
+                            logger.warning("Server closed connection (empty packet received)")
+                            self.running = False
+                            break
+                        self.data += packet
+
+                        # Check for timeout
+                        if time.time() - start_time > 10.0:  # 10 second overall timeout
+                            logger.warning("Timeout while receiving frame data")
+                            self.running = False
+                            break
+                    except socket.timeout:
+                        logger.warning("Socket timeout while receiving frame data")
+                        # Don't break, just try again
+                        continue
+                    except ConnectionResetError:
+                        logger.error("Connection reset by server")
+                        self.running = False
+                        break
+                    except Exception as recv_error:
+                        logger.error(f"Error receiving data: {recv_error}")
+                        self.running = False
+                        break
+
+                if not self.running:
+                    break
 
                 # Extract the frame data
-                frame_data = self.data[:msg_size]
-                self.data = self.data[msg_size:]
+                try:
+                    frame_data = self.data[:msg_size]
+                    self.data = self.data[msg_size:]
 
-                # Deserialize and decode the frame
-                encoded_frame = pickle.loads(frame_data)
-                frame = cv2.imdecode(encoded_frame, cv2.IMREAD_COLOR)
+                    # Deserialize the frame
+                    encoded_frame = pickle.loads(frame_data)
 
-                # Call the callback with the received frame
-                if self.callback:
-                    self.callback(frame)
-            except ConnectionError as e:
-                logger.error(f"Connection error: {e}")
-                break
+                    # Decode the frame
+                    frame = cv2.imdecode(encoded_frame, cv2.IMREAD_COLOR)
+
+                    # Verify frame integrity
+                    if frame is None or frame.size == 0:
+                        logger.warning("Received invalid frame")
+                        continue
+
+                    # Call the callback with the frame
+                    if self.callback:
+                        self.callback(frame)
+                except pickle.UnpicklingError:
+                    logger.error("Error unpickling frame data (corrupted data)")
+                    # Reset the data buffer and try again
+                    self.data = b""
+                    continue
+                except Exception as process_error:
+                    logger.error(f"Error processing received frame: {process_error}")
+                    continue
             except Exception as e:
-                logger.error(f"Error receiving frame: {e}")
-                time.sleep(0.1)
+                logger.error(f"Error in frame receiving loop: {e}")
+                time.sleep(0.1)  # Prevent tight loop if there's a persistent error
+                # Don't break the loop for general exceptions, try to recover
 
         # Clean up
         self.disconnect()

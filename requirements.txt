@@ -1,5 +1,6 @@
 # GUI Framework
 PyQt6>=6.4.0  # Cross-platform GUI framework
+PyQt6-WebEngine>=6.4.0  # Web browser component for PyQt6
 
 # Screen Capture and Remote Control
 pyautogui>=0.9.53  # For mouse and keyboard control

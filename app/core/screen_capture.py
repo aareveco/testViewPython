@@ -72,15 +72,38 @@ class ScreenCapture:
                     "height": height
                 }
             else:
+                # Make sure we have a valid monitor index
+                if self.current_monitor < 1 or self.current_monitor >= len(self.monitors):
+                    logger.error(f"Invalid monitor index: {self.current_monitor}")
+                    return None
+
                 monitor = self.monitors[self.current_monitor]
 
-            # Capture the screen
-            sct_img = self.sct.grab(monitor)
+            # Capture the screen with error handling
+            try:
+                sct_img = self.sct.grab(monitor)
+            except Exception as grab_error:
+                logger.error(f"Error grabbing screen: {grab_error}")
+                # Try to reinitialize the screen capture
+                try:
+                    self.sct = mss.mss()
+                    self.monitors = self.sct.monitors
+                    sct_img = self.sct.grab(monitor)
+                except Exception as reinit_error:
+                    logger.error(f"Failed to reinitialize screen capture: {reinit_error}")
+                    return None
 
-            # Convert to numpy array
-            img = np.array(sct_img)
-
-            return img
+            # Convert to numpy array safely
+            try:
+                # Use PIL as an intermediate step for safer conversion
+                pil_img = Image.frombytes("RGB", (sct_img.width, sct_img.height), sct_img.rgb)
+                img = np.array(pil_img)
+                # Convert from RGB to BGR for OpenCV compatibility
+                img = img[:, :, ::-1].copy()  # Make a copy to ensure memory is contiguous
+                return img
+            except Exception as convert_error:
+                logger.error(f"Error converting screen capture to numpy array: {convert_error}")
+                return None
         except Exception as e:
             logger.error(f"Error capturing screen: {e}")
             return None
