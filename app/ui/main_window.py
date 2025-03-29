@@ -10,7 +10,8 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QComboBox,
-    QTabWidget, QGroupBox, QStatusBar, QMessageBox
+    QTabWidget, QGroupBox, QStatusBar, QMessageBox,
+    QCheckBox
 )
 from PyQt6.QtCore import QSize, Qt, QTimer, QEvent, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QMouseEvent, QKeyEvent
@@ -106,7 +107,7 @@ class MainWindow(QMainWindow):
         host_layout = QHBoxLayout()
         host_label = QLabel("Host:")
         self.host_input = QLineEdit()
-        self.host_input.setPlaceholderText("Enter IP address or hostname")
+        self.host_input.setPlaceholderText("Enter IP address, hostname, or ngrok URL")
         host_layout.addWidget(host_label)
         host_layout.addWidget(self.host_input)
         connection_layout.addLayout(host_layout)
@@ -199,6 +200,47 @@ class MainWindow(QMainWindow):
         port_layout.addWidget(port_label)
         port_layout.addWidget(self.host_port_input)
         host_layout.addLayout(port_layout)
+
+        # ngrok option
+        ngrok_layout = QVBoxLayout()
+        ngrok_header_layout = QHBoxLayout()
+        self.use_ngrok_checkbox = QCheckBox("Use ngrok for public access")
+        self.use_ngrok_checkbox.setToolTip("Enable this to make your stream accessible from the internet")
+        ngrok_header_layout.addWidget(self.use_ngrok_checkbox)
+        ngrok_layout.addLayout(ngrok_header_layout)
+
+        # Add a note about ngrok limitations
+        ngrok_note = QLabel("Note: Free ngrok accounts have limitations. If TCP tunnels fail, HTTP will be used as a fallback.")
+        ngrok_note.setWordWrap(True)
+        ngrok_note.setStyleSheet("color: #666; font-size: 10px;")
+        ngrok_layout.addWidget(ngrok_note)
+
+        host_layout.addLayout(ngrok_layout)
+
+        # ngrok URL display (initially hidden)
+        self.ngrok_group = QGroupBox("ngrok Public URLs")
+        self.ngrok_group.setVisible(False)
+        ngrok_group_layout = QVBoxLayout(self.ngrok_group)
+
+        # Video URL
+        video_url_layout = QHBoxLayout()
+        video_url_label = QLabel("Video URL:")
+        self.video_url_display = QLineEdit()
+        self.video_url_display.setReadOnly(True)
+        video_url_layout.addWidget(video_url_label)
+        video_url_layout.addWidget(self.video_url_display)
+        ngrok_group_layout.addLayout(video_url_layout)
+
+        # Command URL
+        command_url_layout = QHBoxLayout()
+        command_url_label = QLabel("Command URL:")
+        self.command_url_display = QLineEdit()
+        self.command_url_display.setReadOnly(True)
+        command_url_layout.addWidget(command_url_label)
+        command_url_layout.addWidget(self.command_url_display)
+        ngrok_group_layout.addLayout(command_url_layout)
+
+        host_layout.addWidget(self.ngrok_group)
 
         # Start/Stop hosting buttons
         button_layout = QHBoxLayout()
@@ -331,19 +373,27 @@ class MainWindow(QMainWindow):
         port = self.port_input.text()
 
         if not host:
-            QMessageBox.warning(self, "Connection Error", "Please enter a host address")
+            QMessageBox.warning(self, "Connection Error", "Please enter a host address or ngrok URL")
             return
 
-        try:
-            port_num = int(port)
-            if port_num < 1 or port_num > 65535:
-                raise ValueError("Port out of range")
-        except ValueError:
-            QMessageBox.warning(self, "Connection Error", "Please enter a valid port number (1-65535)")
-            return
+        # Check if this is an ngrok URL
+        is_ngrok_url = '://' in host or '.ngrok.io' in host
 
-        logger.info(f"Connecting to {host}:{port}")
-        self.status_bar.showMessage(f"Connecting to {host}:{port}...")
+        # Only validate port if not an ngrok URL
+        if not is_ngrok_url:
+            try:
+                port_num = int(port)
+                if port_num < 1 or port_num > 65535:
+                    raise ValueError("Port out of range")
+            except ValueError:
+                QMessageBox.warning(self, "Connection Error", "Please enter a valid port number (1-65535)")
+                return
+        else:
+            # For ngrok URLs, we'll use the port from the URL
+            port_num = 0  # This will be ignored
+            logger.info(f"Connecting to ngrok URL: {host}")
+
+        self.status_bar.showMessage(f"Connecting to {host}...")
 
         # Disable connect button during connection attempt
         self.connect_button.setEnabled(False)
@@ -355,7 +405,7 @@ class MainWindow(QMainWindow):
         if self.stream_client.connect(host, port_num):
             # Connection successful
             self.is_connected = True
-            self.status_bar.showMessage(f"Connected to {host}:{port}")
+            self.status_bar.showMessage(f"Connected to {host}")
             self.disconnect_button.setEnabled(True)
 
             # Add to recent connections if not already there
@@ -365,8 +415,8 @@ class MainWindow(QMainWindow):
             # Connection failed
             self.stream_client = None
             self.connect_button.setEnabled(True)
-            self.status_bar.showMessage(f"Failed to connect to {host}:{port}")
-            QMessageBox.warning(self, "Connection Error", f"Failed to connect to {host}:{port}")
+            self.status_bar.showMessage(f"Failed to connect to {host}")
+            QMessageBox.warning(self, "Connection Error", f"Failed to connect to {host}")
 
     def on_disconnect_clicked(self):
         """Handle disconnect button click"""
@@ -574,6 +624,7 @@ class MainWindow(QMainWindow):
     def on_start_hosting_clicked(self):
         """Handle start hosting button click"""
         port = self.host_port_input.text()
+        use_ngrok = self.use_ngrok_checkbox.isChecked()
 
         try:
             port_num = int(port)
@@ -583,11 +634,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Hosting Error", "Please enter a valid port number (1-65535)")
             return
 
-        logger.info(f"Starting hosting on port {port}")
+        logger.info(f"Starting hosting on port {port} (ngrok: {use_ngrok})")
         self.status_bar.showMessage(f"Starting hosting on port {port}...")
 
         # Create a stream server
-        self.stream_server = StreamServer(host='', port=port_num)
+        self.stream_server = StreamServer(host='', port=port_num, use_ngrok=use_ngrok)
 
         # Set quality and FPS based on current settings
         quality_values = [25, 50, 75, 95]  # Low, Medium, High, Ultra
@@ -607,6 +658,45 @@ class MainWindow(QMainWindow):
             self.stop_hosting_button.setEnabled(True)
             self.status_bar.showMessage(f"Hosting on port {port}")
 
+            # Update ngrok URLs if using ngrok
+            if use_ngrok and self.stream_server.public_url and self.stream_server.public_command_url:
+                self.ngrok_group.setVisible(True)
+                self.video_url_display.setText(str(self.stream_server.public_url))
+                self.command_url_display.setText(str(self.stream_server.public_command_url))
+
+                # Determine if we're using HTTP or TCP
+                using_http = "http" in str(self.stream_server.public_url).lower()
+                protocol_type = "HTTP" if using_http else "TCP"
+
+                # Show a message with connection instructions
+                connection_msg = (
+                    f"ngrok {protocol_type} tunnels established. To connect from another computer:\n\n"
+                    f"1. Enter the Video URL in the 'Host' field: {str(self.stream_server.public_url)}\n"
+                    f"2. Leave the port field as is (it will be ignored)\n"
+                    f"3. Click Connect\n\n"
+                )
+
+                if using_http:
+                    connection_msg += (
+                        "Note: Using HTTP tunnels instead of TCP due to ngrok free account limitations.\n"
+                        "This may affect performance. For better performance, consider upgrading your ngrok account."
+                    )
+
+                QMessageBox.information(self, "ngrok Connection Info", connection_msg)
+            else:
+                self.ngrok_group.setVisible(False)
+
+                if use_ngrok:
+                    # Show error message if ngrok was enabled but failed
+                    error_msg = (
+                        "Failed to establish ngrok tunnels. This could be due to:\n\n"
+                        "1. ngrok account limitations (free accounts have restrictions on TCP tunnels)\n"
+                        "2. Network connectivity issues\n"
+                        "3. ngrok service being temporarily unavailable\n\n"
+                        "You can still use the application on your local network using your IP address."
+                    )
+                    QMessageBox.warning(self, "ngrok Error", error_msg)
+
             # Start a timer to update the preview
             self.update_preview_timer = QTimer()
             self.update_preview_timer.timeout.connect(self.update_preview)
@@ -623,6 +713,10 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Stopping hosting...")
 
         if self.stream_server:
+            # Check if ngrok was used
+            was_using_ngrok = self.stream_server.use_ngrok
+
+            # Stop the server
             self.stream_server.stop()
             self.stream_server = None
             self.is_hosting = False
@@ -637,6 +731,13 @@ class MainWindow(QMainWindow):
             self.preview_label.setText("Preview not available")
             self.start_hosting_button.setEnabled(True)
             self.stop_hosting_button.setEnabled(False)
+
+            # Hide ngrok group if it was visible
+            if was_using_ngrok:
+                self.ngrok_group.setVisible(False)
+                self.video_url_display.clear()
+                self.command_url_display.clear()
+
             self.status_bar.showMessage("Hosting stopped", 3000)
 
     def update_preview(self):

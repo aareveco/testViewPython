@@ -16,19 +16,21 @@ from typing import Tuple, Callable, Dict, Any, Optional
 from app.core.screen_capture import ScreenCapture
 from app.core.remote_control import RemoteControl
 from app.core.remote_command import RemoteCommand, CommandType
+from app.utils.ngrok_service import NgrokService
 
 logger = logging.getLogger(__name__)
 
 class StreamServer:
     """Class for streaming screen content to clients"""
 
-    def __init__(self, host: str = '', port: int = 5000):
+    def __init__(self, host: str = '', port: int = 5000, use_ngrok: bool = False):
         """
         Initialize the stream server
 
         Args:
             host (str): Host address to bind to (empty string means all interfaces)
             port (int): Port number to listen on
+            use_ngrok (bool): Whether to use ngrok for public access
         """
         self.host = host
         self.port = port
@@ -46,7 +48,13 @@ class StreamServer:
         self.command_socket = None
         self.command_port = port + 1  # Use the next port for commands
 
-        logger.info(f"Stream server initialized with host={host}, port={port}, command_port={self.command_port}")
+        # ngrok settings
+        self.use_ngrok = use_ngrok
+        self.ngrok_service = NgrokService() if use_ngrok else None
+        self.public_url = None
+        self.public_command_url = None
+
+        logger.info(f"Stream server initialized with host={host}, port={port}, command_port={self.command_port}, use_ngrok={use_ngrok}")
 
     def start(self) -> bool:
         """
@@ -73,6 +81,29 @@ class StreamServer:
             self.command_socket.listen(5)
 
             self.running = True
+
+            # Start ngrok tunnels if enabled
+            if self.use_ngrok and self.ngrok_service:
+                # Start tunnel for video streaming
+                self.public_url = self.ngrok_service.start_tunnel(
+                    self.port, "video", "tcp", fallback_to_http=True
+                )
+
+                # Start tunnel for commands
+                self.public_command_url = self.ngrok_service.start_tunnel(
+                    self.command_port, "command", "tcp", fallback_to_http=True
+                )
+
+                if not self.public_url or not self.public_command_url:
+                    logger.error("Failed to start ngrok tunnels")
+                    self.stop()
+                    return False
+
+                # Check if we're using HTTP or TCP
+                video_protocol = "HTTP" if "http" in str(self.public_url).lower() else "TCP"
+                command_protocol = "HTTP" if "http" in str(self.public_command_url).lower() else "TCP"
+
+                logger.info(f"ngrok tunnels established: {self.public_url} ({video_protocol}) and {self.public_command_url} ({command_protocol})")
 
             # Start the connection acceptance thread for video streaming
             self.accept_thread = threading.Thread(target=self._accept_connections)
@@ -117,6 +148,13 @@ class StreamServer:
             except:
                 pass
             self.command_socket = None
+
+        # Stop ngrok tunnels if they were started
+        if self.use_ngrok and self.ngrok_service:
+            self.ngrok_service.stop_all_tunnels()
+            self.public_url = None
+            self.public_command_url = None
+            logger.info("ngrok tunnels stopped")
 
         logger.info("Stream server stopped")
 
@@ -350,13 +388,14 @@ class StreamClient:
 
         logger.info("Stream client initialized")
 
-    def connect(self, host: str, port: int = 5000) -> bool:
+    def connect(self, host: str, port: int = 5000, command_port: Optional[int] = None) -> bool:
         """
         Connect to a streaming server
 
         Args:
-            host (str): Server host address
-            port (int): Server port number
+            host (str): Server host address or ngrok URL
+            port (int): Server port number (ignored if host is an ngrok URL with port)
+            command_port (Optional[int]): Command port number (if None, port+1 is used)
 
         Returns:
             bool: True if connected successfully, False otherwise
@@ -366,7 +405,20 @@ class StreamClient:
             return False
 
         try:
-            # Store host and port for later use
+            # Parse the host if it's an ngrok URL
+            if '://' in host:
+                # Extract host and port from ngrok URL
+                ngrok_host, ngrok_port = self._parse_ngrok_url(host)
+                if ngrok_host and ngrok_port:
+                    host = ngrok_host
+                    port = ngrok_port
+                    logger.info(f"Parsed ngrok URL: {host}:{port}")
+
+            # If command_port is not specified, use port+1
+            if command_port is None:
+                command_port = port + 1
+
+            # Store host and ports for later use
             self.host = host
             self.port = port
 
@@ -374,9 +426,9 @@ class StreamClient:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((host, port))
 
-            # Connect to the command socket (port + 1)
+            # Connect to the command socket
             self.command_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.command_socket.connect((host, port + 1))
+            self.command_socket.connect((host, command_port))
 
             self.running = True
 
@@ -385,7 +437,7 @@ class StreamClient:
             self.receive_thread.daemon = True
             self.receive_thread.start()
 
-            logger.info(f"Connected to stream server at {host}:{port} (video) and {port+1} (commands)")
+            logger.info(f"Connected to stream server at {host}:{port} (video) and {host}:{command_port} (commands)")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to stream server: {e}")
@@ -403,6 +455,51 @@ class StreamClient:
                     pass
                 self.command_socket = None
             return False
+
+    def _parse_ngrok_url(self, url: str) -> Tuple[Optional[str], Optional[int]]:
+        """
+        Parse an ngrok URL to extract host and port
+
+        Args:
+            url (str): The ngrok URL (e.g., tcp://0.tcp.ngrok.io:12345 or http://abcd1234.ngrok.io)
+
+        Returns:
+            Tuple[Optional[str], Optional[int]]: (host, port) or (None, None) if parsing failed
+        """
+        try:
+            # Check if this is an HTTP or TCP URL
+            is_http = 'http://' in url.lower() or 'https://' in url.lower()
+
+            # Remove the protocol if present
+            if '://' in url:
+                url = url.split('://', 1)[1]
+
+            # For HTTP URLs, we need to use a different approach
+            if is_http:
+                # For HTTP URLs, we don't need to extract a port
+                # Just use the host as is and a default port (80 for HTTP)
+                if ':' in url:
+                    # If there's a port specified, extract it
+                    host, port_str = url.rsplit(':', 1)
+                    port = int(port_str)
+                else:
+                    # Otherwise use the default HTTP port
+                    host = url
+                    port = 80
+                return host, port
+            else:
+                # For TCP URLs, extract host and port as before
+                if ':' in url:
+                    host, port_str = url.rsplit(':', 1)
+                    port = int(port_str)
+                    return host, port
+                else:
+                    # TCP URLs should always have a port
+                    logger.error(f"Invalid TCP URL format (no port): {url}")
+                    return None, None
+        except Exception as e:
+            logger.error(f"Failed to parse ngrok URL: {e}")
+            return None, None
 
     def send_command(self, command: RemoteCommand) -> bool:
         """
